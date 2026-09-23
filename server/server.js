@@ -6,12 +6,12 @@ const crypto = require("crypto");
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "50mb" })); // Increased for file uploads
 
 const server = http.createServer(app);
 
 // ── WebSocket server on /ws ──────────────────────────────────────────────────
-const wss = new WebSocketServer({ server, path: "/ws" });
+const wss = new WebSocketServer({ server, path: "/ws", maxPayload: 50 * 1024 * 1024 });
 
 let extensionSocket = null;
 
@@ -20,7 +20,6 @@ wss.on("connection", (ws) => {
   extensionSocket = ws;
   ws.isAlive = true;
 
-  // ── Protocol-level pong handler (response to our pings) ──────────────
   ws.on("pong", () => {
     ws.isAlive = true;
   });
@@ -30,17 +29,16 @@ wss.on("connection", (ws) => {
     try {
       msg = JSON.parse(raw);
     } catch {
-      console.error("[WS] Malformed message:", raw.toString());
+      console.error("[WS] Malformed message:", raw.toString().substring(0, 200));
       return;
     }
 
-    // Handle application-level ping from extension (keepalive)
     if (msg.type === "ping") {
       ws.send(JSON.stringify({ type: "pong" }));
       return;
     }
 
-    // Extension sends back { id, response }
+    // Extension sends back { id, response, files? }
     if (msg.id && msg.response !== undefined) {
       const pending = pendingRequests.get(msg.id);
       if (pending) {
@@ -66,7 +64,14 @@ wss.on("connection", (ws) => {
           },
         };
 
-        console.log(`[API] ✓ Resolved request ${msg.id}`);
+        // Attach extracted files/artifacts if present
+        if (msg.files && msg.files.length > 0) {
+          reply.files = msg.files; // [{ name, content, language }]
+          console.log(`[API] ✓ Resolved ${msg.id} with ${msg.files.length} file(s)`);
+        } else {
+          console.log(`[API] ✓ Resolved request ${msg.id}`);
+        }
+
         pending.res.json(reply);
       } else {
         console.warn(`[WS] No pending request for id=${msg.id}`);
@@ -84,11 +89,8 @@ wss.on("connection", (ws) => {
   });
 });
 
-// ── Server-side heartbeat: ping every 25 seconds ────────────────────────────
-// Sends protocol-level WebSocket pings. If the extension doesn't respond
-// with a pong before the next ping cycle, the connection is terminated.
+// ── Server-side heartbeat ────────────────────────────────────────────────────
 const HEARTBEAT_INTERVAL = 25_000;
-
 const heartbeat = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (!ws.isAlive) {
@@ -100,12 +102,10 @@ const heartbeat = setInterval(() => {
   });
 }, HEARTBEAT_INTERVAL);
 
-wss.on("close", () => {
-  clearInterval(heartbeat);
-});
+wss.on("close", () => clearInterval(heartbeat));
 
 // ── Pending requests map ─────────────────────────────────────────────────────
-const pendingRequests = new Map(); // Map<requestId, { res, timer }>
+const pendingRequests = new Map();
 
 // ── Health check ─────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => {
@@ -120,7 +120,7 @@ app.get("/health", (_req, res) => {
 
 // ── OpenAI-compatible completions endpoint ───────────────────────────────────
 app.post("/v1/chat/completions", (req, res) => {
-  const { messages } = req.body;
+  const { messages, files } = req.body;
 
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({
@@ -133,26 +133,59 @@ app.post("/v1/chat/completions", (req, res) => {
 
   // Extract the latest user message
   const userMessages = messages.filter((m) => m.role === "user");
-  const prompt =
-    userMessages.length > 0
-      ? userMessages[userMessages.length - 1].content
-      : messages[messages.length - 1].content;
+  const lastUserMsg = userMessages.length > 0
+    ? userMessages[userMessages.length - 1]
+    : messages[messages.length - 1];
 
-  if (!prompt) {
+  // Support both string content and OpenAI multi-part content
+  let prompt = "";
+  let attachedFiles = files || []; // Top-level files field
+
+  if (typeof lastUserMsg.content === "string") {
+    prompt = lastUserMsg.content;
+  } else if (Array.isArray(lastUserMsg.content)) {
+    // OpenAI vision-style: [{ type: "text", text: "..." }, { type: "image_url", ... }]
+    for (const part of lastUserMsg.content) {
+      if (part.type === "text") {
+        prompt += part.text;
+      } else if (part.type === "image_url" && part.image_url?.url) {
+        // Extract base64 data from data URI
+        const match = part.image_url.url.match(/^data:([^;]+);base64,(.+)$/);
+        if (match) {
+          attachedFiles.push({
+            name: `image_${attachedFiles.length + 1}.${match[1].split("/")[1] || "png"}`,
+            type: match[1],
+            data: match[2],
+          });
+        }
+      } else if (part.type === "file" && part.data) {
+        attachedFiles.push({
+          name: part.name || `file_${attachedFiles.length + 1}`,
+          type: part.mime_type || "application/octet-stream",
+          data: part.data,
+        });
+      }
+    }
+  }
+
+  // Also support per-message files field
+  if (lastUserMsg.files && Array.isArray(lastUserMsg.files)) {
+    attachedFiles = attachedFiles.concat(lastUserMsg.files);
+  }
+
+  if (!prompt && attachedFiles.length === 0) {
     return res.status(400).json({
       error: {
-        message: "No prompt content found in messages",
+        message: "No prompt content or files found in messages",
         type: "invalid_request_error",
       },
     });
   }
 
-  // Verify extension is connected
   if (!extensionSocket || extensionSocket.readyState !== 1) {
     return res.status(503).json({
       error: {
-        message:
-          "Chrome Extension is not connected. Load the extension and open claude.ai.",
+        message: "Chrome Extension is not connected. Load the extension and open claude.ai.",
         type: "service_unavailable",
       },
     });
@@ -160,7 +193,6 @@ app.post("/v1/chat/completions", (req, res) => {
 
   const requestId = crypto.randomUUID();
 
-  // 120-second timeout → 504
   const timer = setTimeout(() => {
     pendingRequests.delete(requestId);
     if (!res.headersSent) {
@@ -175,16 +207,19 @@ app.post("/v1/chat/completions", (req, res) => {
 
   pendingRequests.set(requestId, { res, timer });
 
-  // Dispatch to extension
+  // Dispatch to extension (with files if any)
   const payload = JSON.stringify({
     action: "SEND_PROMPT",
     id: requestId,
-    prompt,
+    prompt: prompt || "(See attached files)",
+    files: attachedFiles.length > 0 ? attachedFiles : undefined,
   });
 
   extensionSocket.send(payload);
+
+  const fileInfo = attachedFiles.length > 0 ? ` + ${attachedFiles.length} file(s)` : "";
   console.log(
-    `[API] → Dispatched request ${requestId}: "${prompt.substring(0, 80)}…"`
+    `[API] → Dispatched ${requestId}: "${(prompt || "").substring(0, 60)}…"${fileInfo}`
   );
 });
 
@@ -198,6 +233,7 @@ server.listen(PORT, () => {
 ║   HTTP  →  http://localhost:${PORT}                 ║
 ║   WS    →  ws://localhost:${PORT}/ws                ║
 ║   Health→  http://localhost:${PORT}/health           ║
+║   Files →  Upload & Download supported           ║
 ╚══════════════════════════════════════════════════╝
   `);
 });

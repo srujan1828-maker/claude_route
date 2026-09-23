@@ -1,21 +1,17 @@
 // ── WebSocket connection to local bridge server ──────────────────────────────
-// With multi-layer keepalive to prevent MV3 service worker termination.
+// With multi-layer keepalive + file upload/download support.
 
 let ws = null;
 const WS_URL = "ws://localhost:8080/ws";
 const RECONNECT_INTERVAL = 3000;
 const KEEPALIVE_ALARM = "ws-keepalive";
-const KEEPALIVE_INTERVAL_MS = 20_000; // 20s ping cycle (well under Chrome's 30s kill)
+const KEEPALIVE_INTERVAL_MS = 20_000;
 
 // ── Layer 1: chrome.alarms keepalive ─────────────────────────────────────────
-// Chrome alarms periodically wake the service worker even if it was terminated.
-// Minimum alarm period is 0.5 minutes, so we use a workaround for sub-minute intervals.
-
-chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 }); // ~30s
+chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === KEEPALIVE_ALARM) {
-    // If the worker woke up from termination, ws will be null → reconnect
     if (!ws || ws.readyState > 1) {
       console.log("[Bridge] Alarm wakeup – reconnecting WebSocket");
       connectWebSocket();
@@ -24,34 +20,23 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 // ── Layer 2: Content-script port keepalive ───────────────────────────────────
-// A long-lived port from the content script keeps the service worker alive
-// as long as the claude.ai tab is open.
-
 let keepalivePorts = new Set();
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === "keepalive") {
     keepalivePorts.add(port);
     console.log("[Bridge] Keepalive port connected");
-
     port.onDisconnect.addListener(() => {
       keepalivePorts.delete(port);
       console.log("[Bridge] Keepalive port disconnected");
     });
-
-    // Respond to ping messages to keep the port active
     port.onMessage.addListener((msg) => {
-      if (msg.type === "ping") {
-        port.postMessage({ type: "pong" });
-      }
+      if (msg.type === "ping") port.postMessage({ type: "pong" });
     });
   }
 });
 
-// ── Layer 3: WebSocket ping to server ────────────────────────────────────────
-// Sends periodic application-level pings so the server knows we're alive,
-// and the message event resets Chrome's service worker idle timer.
-
+// ── Layer 3: WebSocket ping ──────────────────────────────────────────────────
 let pingInterval = null;
 
 function startPingInterval() {
@@ -64,16 +49,13 @@ function startPingInterval() {
 }
 
 function stopPingInterval() {
-  if (pingInterval) {
-    clearInterval(pingInterval);
-    pingInterval = null;
-  }
+  if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
 }
 
 // ── WebSocket connection ─────────────────────────────────────────────────────
 
 function connectWebSocket() {
-  if (ws && ws.readyState <= 1) return; // CONNECTING or OPEN
+  if (ws && ws.readyState <= 1) return;
 
   ws = new WebSocket(WS_URL);
 
@@ -87,16 +69,15 @@ function connectWebSocket() {
     try {
       msg = JSON.parse(event.data);
     } catch {
-      console.error("[Bridge] Malformed server message:", event.data);
+      console.error("[Bridge] Malformed server message");
       return;
     }
 
-    // Ignore pong responses from server
     if (msg.type === "pong") return;
 
     if (msg.action === "SEND_PROMPT") {
-      console.log(`[Bridge] Received prompt request: ${msg.id}`);
-      await relayToClaudeTab(msg.id, msg.prompt);
+      console.log(`[Bridge] Received prompt request: ${msg.id} (files: ${msg.files?.length || 0})`);
+      await relayToClaudeTab(msg.id, msg.prompt, msg.files);
     }
   });
 
@@ -113,9 +94,9 @@ function connectWebSocket() {
   });
 }
 
-// ── Relay prompt to the active claude.ai tab ─────────────────────────────────
+// ── Relay prompt + files to the active claude.ai tab ─────────────────────────
 
-async function relayToClaudeTab(id, prompt, isRetry = false) {
+async function relayToClaudeTab(id, prompt, files, isRetry = false) {
   try {
     const tabs = await chrome.tabs.query({ url: "https://claude.ai/*" });
 
@@ -125,43 +106,31 @@ async function relayToClaudeTab(id, prompt, isRetry = false) {
       return;
     }
 
-    // Prefer the active tab; fall back to the first match
     const target = tabs.find((t) => t.active) || tabs[0];
 
     chrome.tabs.sendMessage(
       target.id,
-      { action: "INJECT_PROMPT", id, prompt },
+      { action: "INJECT_PROMPT", id, prompt, files },
       async (response) => {
         if (chrome.runtime.lastError) {
-          console.warn(
-            "[Bridge] Content script not reachable:",
-            chrome.runtime.lastError.message
-          );
+          console.warn("[Bridge] Content script not reachable:", chrome.runtime.lastError.message);
 
           if (!isRetry) {
-            // Auto-inject the content script and retry once
             console.log("[Bridge] Auto-injecting content.js into tab", target.id);
             try {
               await chrome.scripting.executeScript({
                 target: { tabId: target.id },
                 files: ["content.js"],
               });
-              // Wait for the script to initialize
               await new Promise((r) => setTimeout(r, 500));
-              console.log("[Bridge] Retrying message after injection…");
-              relayToClaudeTab(id, prompt, true);
+              console.log("[Bridge] Retrying after injection…");
+              relayToClaudeTab(id, prompt, files, true);
             } catch (injectErr) {
               console.error("[Bridge] Injection failed:", injectErr);
-              sendToServer({
-                id,
-                response: `[ERROR] Failed to inject content script: ${injectErr.message}`,
-              });
+              sendToServer({ id, response: `[ERROR] Failed to inject: ${injectErr.message}` });
             }
           } else {
-            sendToServer({
-              id,
-              response: `[ERROR] Content script unreachable even after injection. Please refresh the claude.ai tab.`,
-            });
+            sendToServer({ id, response: "[ERROR] Content script unreachable. Refresh claude.ai tab." });
           }
         }
       }
@@ -176,12 +145,12 @@ async function relayToClaudeTab(id, prompt, isRetry = false) {
 
 chrome.runtime.onMessage.addListener((msg, _sender, _sendResponse) => {
   if (msg.action === "OUTPUT_READY") {
-    console.log(`[Bridge] Response ready for ${msg.id}`);
-    sendToServer({ id: msg.id, response: msg.text });
+    console.log(`[Bridge] Response ready for ${msg.id} (files: ${msg.files?.length || 0})`);
+    sendToServer({ id: msg.id, response: msg.text, files: msg.files });
   }
 });
 
-// ── Send message to server via WebSocket ─────────────────────────────────────
+// ── Send to server ───────────────────────────────────────────────────────────
 
 function sendToServer(data) {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -192,5 +161,4 @@ function sendToServer(data) {
 }
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
-
 connectWebSocket();
