@@ -1,41 +1,58 @@
-// ── WebSocket connection to local or cloud bridge server ─────────────────────
-// With multi-layer keepalive + file upload/download support.
-// Reads config from config.js (imported as module).
-
-import "./config.js";
-
-// ── Read config ──────────────────────────────────────────────────────────────
-const cfg = globalThis.BRIDGE_CONFIG || {};
-const BASE_WS_URL = cfg.SERVER_WS_URL || "ws://localhost:8080/ws";
-const WS_SECRET = cfg.WS_SECRET || "";
-
-// Build the actual URL with auth token if configured
-function getWsUrl() {
-  if (WS_SECRET) {
-    const sep = BASE_WS_URL.includes("?") ? "&" : "?";
-    return `${BASE_WS_URL}${sep}token=${encodeURIComponent(WS_SECRET)}`;
-  }
-  return BASE_WS_URL;
-}
+// ── Claude Web Bridge – Background Service Worker ────────────────────────────
+// Reads server URL & secret from chrome.storage.local (set via popup UI).
+// Multi-layer keepalive + file relay support.
 
 let ws = null;
+let currentUrl = "";
+let currentSecret = "";
+
+const DEFAULT_URL = "ws://localhost:8080/ws";
 const RECONNECT_INTERVAL = 3000;
 const KEEPALIVE_ALARM = "ws-keepalive";
 const KEEPALIVE_INTERVAL_MS = 20_000;
 
+// ── Load config from storage and connect ─────────────────────────────────────
+
+async function loadConfigAndConnect() {
+  const data = await chrome.storage.local.get(["serverWsUrl", "wsSecret"]);
+  currentUrl = data.serverWsUrl || DEFAULT_URL;
+  currentSecret = data.wsSecret || "";
+  console.log(`[Bridge] Config loaded: ${currentUrl}`);
+  forceReconnect();
+}
+
+function getWsUrl() {
+  if (currentSecret) {
+    const sep = currentUrl.includes("?") ? "&" : "?";
+    return `${currentUrl}${sep}token=${encodeURIComponent(currentSecret)}`;
+  }
+  return currentUrl;
+}
+
+function forceReconnect() {
+  if (ws) {
+    ws.close();
+    ws = null;
+  }
+  stopPingInterval();
+  connectWebSocket();
+}
+
 // ── Layer 1: chrome.alarms keepalive ─────────────────────────────────────────
+
 chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === KEEPALIVE_ALARM) {
     if (!ws || ws.readyState > 1) {
       console.log("[Bridge] Alarm wakeup – reconnecting WebSocket");
-      connectWebSocket();
+      loadConfigAndConnect();
     }
   }
 });
 
 // ── Layer 2: Content-script port keepalive ───────────────────────────────────
+
 let keepalivePorts = new Set();
 
 chrome.runtime.onConnect.addListener((port) => {
@@ -53,6 +70,7 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 // ── Layer 3: WebSocket ping ──────────────────────────────────────────────────
+
 let pingInterval = null;
 
 function startPingInterval() {
@@ -72,9 +90,13 @@ function stopPingInterval() {
 
 function connectWebSocket() {
   if (ws && ws.readyState <= 1) return;
+  if (!currentUrl) {
+    console.log("[Bridge] No server URL configured");
+    return;
+  }
 
   const url = getWsUrl();
-  console.log(`[Bridge] Connecting to ${BASE_WS_URL}…`);
+  console.log(`[Bridge] Connecting to ${currentUrl}…`);
   ws = new WebSocket(url);
 
   ws.addEventListener("open", () => {
@@ -160,12 +182,30 @@ async function relayToClaudeTab(id, prompt, files, isRetry = false) {
   }
 }
 
-// ── Receive OUTPUT_READY from content script ─────────────────────────────────
+// ── Messages from popup & content script ─────────────────────────────────────
 
-chrome.runtime.onMessage.addListener((msg, _sender, _sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.action === "OUTPUT_READY") {
     console.log(`[Bridge] Response ready for ${msg.id} (files: ${msg.files?.length || 0})`);
     sendToServer({ id: msg.id, response: msg.text, files: msg.files });
+    return;
+  }
+
+  if (msg.action === "RECONNECT") {
+    console.log("[Bridge] Reconnect requested from popup");
+    loadConfigAndConnect();
+    sendResponse({ ok: true });
+    return;
+  }
+
+  if (msg.action === "GET_STATUS") {
+    const connected = ws && ws.readyState === WebSocket.OPEN;
+    sendResponse({
+      connected,
+      url: currentUrl,
+      error: connected ? null : "Not connected to server",
+    });
+    return;
   }
 });
 
@@ -180,4 +220,4 @@ function sendToServer(data) {
 }
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
-connectWebSocket();
+loadConfigAndConnect();
