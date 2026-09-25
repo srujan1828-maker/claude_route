@@ -1,8 +1,24 @@
-// ── WebSocket connection to local bridge server ──────────────────────────────
+// ── WebSocket connection to local or cloud bridge server ─────────────────────
 // With multi-layer keepalive + file upload/download support.
+// Reads config from config.js (imported as module).
+
+import "./config.js";
+
+// ── Read config ──────────────────────────────────────────────────────────────
+const cfg = globalThis.BRIDGE_CONFIG || {};
+const BASE_WS_URL = cfg.SERVER_WS_URL || "ws://localhost:8080/ws";
+const WS_SECRET = cfg.WS_SECRET || "";
+
+// Build the actual URL with auth token if configured
+function getWsUrl() {
+  if (WS_SECRET) {
+    const sep = BASE_WS_URL.includes("?") ? "&" : "?";
+    return `${BASE_WS_URL}${sep}token=${encodeURIComponent(WS_SECRET)}`;
+  }
+  return BASE_WS_URL;
+}
 
 let ws = null;
-const WS_URL = "ws://localhost:8080/ws";
 const RECONNECT_INTERVAL = 3000;
 const KEEPALIVE_ALARM = "ws-keepalive";
 const KEEPALIVE_INTERVAL_MS = 20_000;
@@ -57,7 +73,9 @@ function stopPingInterval() {
 function connectWebSocket() {
   if (ws && ws.readyState <= 1) return;
 
-  ws = new WebSocket(WS_URL);
+  const url = getWsUrl();
+  console.log(`[Bridge] Connecting to ${BASE_WS_URL}…`);
+  ws = new WebSocket(url);
 
   ws.addEventListener("open", () => {
     console.log("[Bridge] ✓ Connected to server");
@@ -81,8 +99,9 @@ function connectWebSocket() {
     }
   });
 
-  ws.addEventListener("close", () => {
-    console.log("[Bridge] Disconnected – retrying in 3s…");
+  ws.addEventListener("close", (event) => {
+    const reason = event.reason || "unknown";
+    console.log(`[Bridge] Disconnected (code=${event.code}, reason=${reason}) – retrying in 3s…`);
     ws = null;
     stopPingInterval();
     setTimeout(connectWebSocket, RECONNECT_INTERVAL);

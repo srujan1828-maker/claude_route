@@ -4,18 +4,58 @@ const { WebSocketServer } = require("ws");
 const cors = require("cors");
 const crypto = require("crypto");
 
+// ── Config from environment ──────────────────────────────────────────────────
+const PORT = parseInt(process.env.PORT || "8080");
+const API_KEY = process.env.API_KEY || ""; // Set this in cloud env vars
+const WS_SECRET = process.env.WS_SECRET || ""; // Extension uses this to authenticate
+const NODE_ENV = process.env.NODE_ENV || "development";
+
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "50mb" })); // Increased for file uploads
+app.use(express.json({ limit: "50mb" }));
 
 const server = http.createServer(app);
+
+// ── Auth middleware ──────────────────────────────────────────────────────────
+// In production, require API_KEY for HTTP endpoints and WS_SECRET for WebSocket.
+// In development (no keys set), everything is open.
+
+function authMiddleware(req, res, next) {
+  if (!API_KEY) return next(); // No key configured = open access
+
+  const provided =
+    req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
+    req.headers["x-api-key"] ||
+    req.query.api_key;
+
+  if (provided !== API_KEY) {
+    return res.status(401).json({
+      error: {
+        message: "Invalid or missing API key. Provide via Authorization: Bearer <key>",
+        type: "authentication_error",
+      },
+    });
+  }
+  next();
+}
 
 // ── WebSocket server on /ws ──────────────────────────────────────────────────
 const wss = new WebSocketServer({ server, path: "/ws", maxPayload: 50 * 1024 * 1024 });
 
 let extensionSocket = null;
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
+  // Authenticate WebSocket connections in production
+  if (WS_SECRET) {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const token = url.searchParams.get("token");
+    if (token !== WS_SECRET) {
+      console.log("[WS] Rejected – invalid token");
+      ws.close(4001, "Invalid token");
+      return;
+    }
+  }
+
   console.log("[WS] Chrome Extension connected");
   extensionSocket = ws;
   ws.isAlive = true;
@@ -64,9 +104,8 @@ wss.on("connection", (ws) => {
           },
         };
 
-        // Attach extracted files/artifacts if present
         if (msg.files && msg.files.length > 0) {
-          reply.files = msg.files; // [{ name, content, language }]
+          reply.files = msg.files;
           console.log(`[API] ✓ Resolved ${msg.id} with ${msg.files.length} file(s)`);
         } else {
           console.log(`[API] ✓ Resolved request ${msg.id}`);
@@ -107,7 +146,7 @@ wss.on("close", () => clearInterval(heartbeat));
 // ── Pending requests map ─────────────────────────────────────────────────────
 const pendingRequests = new Map();
 
-// ── Health check ─────────────────────────────────────────────────────────────
+// ── Health check (public — no auth needed) ───────────────────────────────────
 app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
@@ -119,7 +158,7 @@ app.get("/health", (_req, res) => {
 });
 
 // ── OpenAI-compatible completions endpoint ───────────────────────────────────
-app.post("/v1/chat/completions", (req, res) => {
+app.post("/v1/chat/completions", authMiddleware, (req, res) => {
   const { messages, files } = req.body;
 
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
@@ -137,19 +176,16 @@ app.post("/v1/chat/completions", (req, res) => {
     ? userMessages[userMessages.length - 1]
     : messages[messages.length - 1];
 
-  // Support both string content and OpenAI multi-part content
   let prompt = "";
-  let attachedFiles = files || []; // Top-level files field
+  let attachedFiles = files || [];
 
   if (typeof lastUserMsg.content === "string") {
     prompt = lastUserMsg.content;
   } else if (Array.isArray(lastUserMsg.content)) {
-    // OpenAI vision-style: [{ type: "text", text: "..." }, { type: "image_url", ... }]
     for (const part of lastUserMsg.content) {
       if (part.type === "text") {
         prompt += part.text;
       } else if (part.type === "image_url" && part.image_url?.url) {
-        // Extract base64 data from data URI
         const match = part.image_url.url.match(/^data:([^;]+);base64,(.+)$/);
         if (match) {
           attachedFiles.push({
@@ -168,7 +204,6 @@ app.post("/v1/chat/completions", (req, res) => {
     }
   }
 
-  // Also support per-message files field
   if (lastUserMsg.files && Array.isArray(lastUserMsg.files)) {
     attachedFiles = attachedFiles.concat(lastUserMsg.files);
   }
@@ -207,7 +242,6 @@ app.post("/v1/chat/completions", (req, res) => {
 
   pendingRequests.set(requestId, { res, timer });
 
-  // Dispatch to extension (with files if any)
   const payload = JSON.stringify({
     action: "SEND_PROMPT",
     id: requestId,
@@ -224,16 +258,15 @@ app.post("/v1/chat/completions", (req, res) => {
 });
 
 // ── Start ────────────────────────────────────────────────────────────────────
-const PORT = 8080;
 server.listen(PORT, () => {
+  const mode = API_KEY ? "🔒 Authenticated" : "🔓 Open (no API_KEY set)";
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║   Claude Web Bridge – OpenAI-Compatible Proxy    ║
+║   Claude Web Bridge – Cloud Server               ║
 ║──────────────────────────────────────────────────║
-║   HTTP  →  http://localhost:${PORT}                 ║
-║   WS    →  ws://localhost:${PORT}/ws                ║
-║   Health→  http://localhost:${PORT}/health           ║
-║   Files →  Upload & Download supported           ║
+║   Port    →  ${String(PORT).padEnd(36)}║
+║   Mode    →  ${mode.padEnd(36)}║
+║   Files   →  Upload & Download supported         ║
 ╚══════════════════════════════════════════════════╝
   `);
 });
